@@ -3,26 +3,32 @@ import requests
 import datetime
 import json
 import os
-import time
 import logging
 from logging.handlers import RotatingFileHandler
 from pickledb import PickleDB
 
-# --- Constants ---
+# --- ERPNext/BioTime Constants ---
 EMPLOYEE_NOT_FOUND_ERROR_MESSAGE = "No Employee found for the given employee field value"
 EMPLOYEE_INACTIVE_ERROR_MESSAGE = "Transactions cannot be created for an Inactive Employee"
 DUPLICATE_EMPLOYEE_CHECKIN_ERROR_MESSAGE = "This employee already has a log with the same timestamp"
+
 allowlisted_errors = [
     EMPLOYEE_NOT_FOUND_ERROR_MESSAGE,
     EMPLOYEE_INACTIVE_ERROR_MESSAGE,
     DUPLICATE_EMPLOYEE_CHECKIN_ERROR_MESSAGE
 ]
 
+if hasattr(config, 'allowed_exceptions'):
+    allowlisted_errors_temp = []
+    for error_number in config.allowed_exceptions:
+        allowlisted_errors_temp.append(allowlisted_errors[error_number - 1])
+    allowlisted_errors = allowlisted_errors_temp
+
 device_punch_values_IN = getattr(config, 'device_punch_values_IN', [0, 4])
 device_punch_values_OUT = getattr(config, 'device_punch_values_OUT', [1, 5])
 ERPNEXT_VERSION = getattr(config, 'ERPNEXT_VERSION', 15)
 
-# --- Setup Logging & Status DB ---
+# --- Setup Logging & Status ---
 if not os.path.exists(config.LOGS_DIRECTORY):
     os.makedirs(config.LOGS_DIRECTORY)
 
@@ -40,7 +46,7 @@ error_logger = setup_logger('error_logger', os.path.join(config.LOGS_DIRECTORY, 
 info_logger = setup_logger('info_logger', os.path.join(config.LOGS_DIRECTORY, 'logs.log'))
 status = PickleDB(os.path.join(config.LOGS_DIRECTORY, 'status.json'))
 
-# --- Utility ---
+# --- Utilities ---
 def _safe_convert_date(datestring, pattern):
     try:
         return datetime.datetime.strptime(datestring, pattern)
@@ -50,9 +56,14 @@ def _safe_convert_date(datestring, pattern):
 def _safe_get_error_str(res):
     try:
         error_json = res.json()
-        return json.loads(error_json['exc'])[0] if 'exc' in error_json else json.dumps(error_json)
+        if 'exc' in error_json:
+            return json.loads(error_json['exc'])[0]
+        return json.dumps(error_json)
     except:
         return str(res.content)
+
+def get_dump_file_name_and_directory(device_id, device_ip):
+    return config.LOGS_DIRECTORY + '/' + device_id + "_" + device_ip.replace('.', '_') + '_last_fetch_dump.json'
 
 # --- BioTime Fetch ---
 def get_biotime_token(server_ip, server_port, username, password):
@@ -119,24 +130,34 @@ def send_to_erpnext(employee_field_value, timestamp, device_id=None, log_type=No
     else:
         return resp.status_code, _safe_get_error_str(resp)
 
-# --- Main Logic ---
-def get_time_range():
-    """Determine start and end time automatically."""
-    last_ts = _safe_convert_date(status.get('last_success_push'), "%Y-%m-%d %H:%M:%S")
+# --- Time Range ---
+def get_time_range(device_id):
+    last_ts_str = status.get(f'{device_id}_last_success_push')
+    last_ts = _safe_convert_date(last_ts_str, "%Y-%m-%d %H:%M:%S")
     if not last_ts:
         last_ts = _safe_convert_date(config.IMPORT_START_DATE, "%Y%m%d")
-    start_time = last_ts or (datetime.datetime.now() - datetime.timedelta(days=1))
+    start_time = last_ts or (datetime.datetime.now() - datetime.timedelta(days=10))
     end_time = datetime.datetime.now()
     return start_time.strftime("%Y-%m-%d %H:%M:%S"), end_time.strftime("%Y-%m-%d %H:%M:%S")
 
+# --- Core ---
 def pull_and_push(device):
-    start_time, end_time = get_time_range()
+    attendance_success_log_file = '_'.join(["attendance_success_log", device['device_id']])
+    attendance_failed_log_file = '_'.join(["attendance_failed_log", device['device_id']])
+    success_logger = setup_logger(attendance_success_log_file,
+                                  os.path.join(config.LOGS_DIRECTORY, attendance_success_log_file) + '.log')
+    fail_logger = setup_logger(attendance_failed_log_file,
+                               os.path.join(config.LOGS_DIRECTORY, attendance_failed_log_file) + '.log')
+
+    start_time, end_time = get_time_range(device['device_id'])
     info_logger.info(f"Fetching logs for {device['device_id']} from {start_time} to {end_time}")
+
     logs = get_all_attendance_from_biotime(
         device['server_ip'], device['server_port'],
         device['username'], device['password'],
         start_time, end_time
     )
+
     for log in logs:
         punch_direction = device.get('punch_direction', None)
         if punch_direction == 'AUTO':
@@ -149,21 +170,29 @@ def pull_and_push(device):
             punch_direction, device['latitude'], device['longitude']
         )
         if status_code == 200:
-            status.set('last_success_push', str(log['timestamp']))
+            success_logger.info("\t".join([
+                msg, str(log['uid']), str(log['user_id']),
+                str(log['timestamp'].timestamp()), str(log['punch']), str(log['status']),
+                json.dumps(log, default=str)
+            ]))
+            status.set(f'{device["device_id"]}_last_success_push', str(log['timestamp']))
             status.save()
         else:
-            error_logger.error(f"Failed for {log['user_id']} @ {log['timestamp']}: {msg}")
+            fail_logger.error("\t".join([
+                str(status_code), str(log['uid']), str(log['user_id']),
+                str(log['timestamp'].timestamp()), str(log['punch']), str(log['status']),
+                json.dumps(log, default=str)
+            ]))
             if not any(err in msg for err in allowlisted_errors):
-                raise Exception("Critical ERPNext Push Failure")
+                raise Exception(f"Critical ERPNext Push Failure for device {device['device_id']}")
 
-def main_loop():
-    while True:
-        for device in config.devices:
-            try:
-                pull_and_push(device)
-            except Exception as e:
-                error_logger.exception(f"Error with device {device['device_id']}: {e}")
-        time.sleep(config.PULL_FREQUENCY * 60)
+# --- Main ---
+def main():
+    for device in config.devices:
+        try:
+            pull_and_push(device)
+        except Exception as e:
+            error_logger.exception(f"Error with device {device['device_id']}: {e}")
 
 if __name__ == "__main__":
-    main_loop()
+    main()

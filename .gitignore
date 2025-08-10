@@ -1,4 +1,5 @@
 local_config.py
+erpnext_sync_1.py
 .vscode
 logs/
 

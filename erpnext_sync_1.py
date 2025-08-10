@@ -52,7 +52,7 @@ def main():
             for device in config.devices:
                 device_attendance_logs = None
                 info_logger.info("Processing Device: "+ device['device_id'])
-                dump_file = get_dump_file_name_and_directory(device['device_id'], device['ip'])
+                dump_file = get_dump_file_name_and_directory(device['device_id'], device['server_ip'])
                 if os.path.exists(dump_file):
                     info_logger.error('Device Attendance Dump Found in Log Directory. This can mean the program crashed unexpectedly. Retrying with dumped data.')
                     with open(dump_file, 'r') as f:
@@ -91,7 +91,7 @@ def pull_process_and_push_data(device, device_attendance_logs=None):
     if not device_attendance_logs:
         #device_attendance_logs = get_all_attendance_from_device(device['ip'], device_id=device['device_id'], clear_from_device_on_fetch=device['clear_from_device_on_fetch'])
         att_logs = get_all_attendance_from_biotime(
-        server_ip="192.168.100.62",
+        server_ip="192.168.100.70",
         server_port=8085,
         username="admin",
         password="Enest@123",
